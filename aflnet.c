@@ -1,3 +1,4 @@
+#include <assert.h>
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -10,6 +11,7 @@
 
 #include "alloc-inl.h"
 #include "aflnet.h"
+#include "iso_parse.h"
 
 // Protocol-specific functions for extracting requests and responses
 
@@ -1235,6 +1237,77 @@ region_t* extract_requests_ipp(unsigned char* buf, unsigned int buf_size, unsign
   *region_count_ref = region_count;
   return regions;
 }
+
+/*
+ * We assume all MMS packets start with 0x030000
+ */
+region_t* extract_requests_mms(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref)
+{
+  char* mem;
+  unsigned int byte_count = 0, mem_count = 0, mem_size = 1024, region_count = 0;
+  region_t *regions = NULL;
+  const static char starter[3] = {0x03, 0x00, 0x00};
+  
+  mem = (char*)ck_alloc(mem_size);
+
+  unsigned int cur_start = 0, cur_end = 0;
+
+  while (byte_count < buf_size) {
+    memcpy(&mem[mem_count], buf + byte_count++, 1);
+
+    // check if the last three bytes are 0x030000
+    if ((mem_count > 2) && (memcmp(&mem[mem_count - 2], starter, 3) == 0)) {
+      region_count++;
+      regions = (region_t*)ck_realloc(regions, region_count * sizeof(region_t));
+      regions[region_count - 1].start_byte = cur_start;
+      regions[region_count - 1].end_byte = cur_end - 3;
+      regions[region_count - 1].state_sequence = NULL;
+      regions[region_count - 1].state_count = 0;
+
+      mem_count = 0;
+      cur_start = cur_end - 2;
+      cur_end++;
+    } else {
+      mem_count++;
+      cur_end++;
+
+      // check if the last byte has been reached
+      if (cur_end == buf_size - 1) {
+        region_count++;
+        regions = (region_t *)ck_realloc(regions, region_count * sizeof(region_t));
+        regions[region_count - 1].start_byte = cur_start;
+        regions[region_count - 1].end_byte = cur_end;
+        regions[region_count - 1].state_sequence = NULL;
+        regions[region_count - 1].state_count = 0;
+        break;
+      }
+
+      if (mem_count == mem_size) {
+        // enlarge the mem buffer
+        mem_size = mem_size * 2;
+        mem=(char *)ck_realloc(mem, mem_size);
+      }
+    }
+  }
+
+  if (mem) ck_free(mem);
+
+  //in case region_count equals zero, it means that the structure of the buffer is broken
+  //hence we create one region for the whole buffer
+  if ((region_count == 0) && (buf_size > 0)) {
+    regions = (region_t *)ck_realloc(regions, sizeof(region_t));
+    regions[0].start_byte = 0;
+    regions[0].end_byte = buf_size - 1;
+    regions[0].state_sequence = NULL;
+    regions[0].state_count = 0;
+
+    region_count = 1;
+  }
+
+  *region_count_ref = region_count;
+  return regions;
+}
+
 unsigned int* extract_response_codes_tftp(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref)
 {
   char *mem;
@@ -2324,6 +2397,57 @@ unsigned int* extract_response_codes_ipp(unsigned char* buf, unsigned int buf_si
   if (mem) ck_free(mem);
   *state_count_ref = state_count;
   return state_sequence;
+}
+
+u32* extract_response_codes_mms(u8* buf, const u32 buf_size, u32* state_count_ref)
+{
+  u32 state_count = 0, *state_sequence = NULL;
+  u32 pos = 0;
+
+  // initial state
+  state_count++;
+  state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
+  if (state_sequence == NULL) PFATAL("Unable realloc a memory region to store state sequence");
+  state_sequence[state_count - 1] = 0;
+  
+
+  IsoConnection self;
+  while (pos < buf_size) {
+    memset(&self, 0, sizeof(IsoConnection));
+    // TPKT
+    assert(buf[pos] == 0x03 && buf[pos + 1] == 0x00);
+    pos += 2;
+    const u16 packet_len = ((u16)buf[pos] << 8) + buf[pos + 1];
+    pos += 2;
+
+    ByteBuffer cotp_buf;
+    cotp_buf.buf = buf + 4;
+    cotp_buf.size = packet_len - 4;
+    CotpIndication cotp_indication = parse_cotp(&self, &cotp_buf);
+
+    switch (cotp_indication) {
+      case COTP_ERROR:
+        assert(0);
+
+      case COTP_CONNECT_CONFIRM:
+        goto collect_state;
+        break;
+
+      case COTP_DATA:
+        break;
+
+      case COTP_MORE_FRAGMENTS_FOLLOW:
+        break;
+    }
+
+    SessionIndication session_indication = parse_session(&self, &(self.cotp_payload));
+
+collect_state:
+    state_count++;
+    state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
+    if (state_sequence == NULL) PFATAL("Unable realloc a memory region to store state sequence");
+    state_sequence[state_count - 1] = 0;
+  }
 }
 
 // kl_messages manipulating functions
