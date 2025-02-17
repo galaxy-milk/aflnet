@@ -19,10 +19,21 @@ typedef struct {
   u32 state_count;
 } State;
 
+// typedef enum: u8 {
+//   GetNameList = 0xa1,
+// } ConfirmedServiceResponse;
+
 typedef struct {
   u8 cotp_pdu_type;
+  u8 session_spdu_type;
+  u8 presentation_context_id;
+
+  u8 mms_pdu_type;
+  u8 mms_service_type;
+
   ByteBuffer cotp_payload;
   ByteBuffer user_data;
+  ByteBuffer mms_data;
 } IsoConnection;
 
 typedef enum {
@@ -52,5 +63,11 @@ CotpIndication parse_cotp(IsoConnection*, ByteBuffer*);
 
 SessionIndication parse_session(IsoConnection*, ByteBuffer*);
 SessionIndication parse_session_header_parameters(IsoConnection*, ByteBuffer*, u32);
+
+int parse_presentation_user_data(IsoConnection*, ByteBuffer*);
+
+int parse_mms(IsoConnection*, ByteBuffer*);
+
+u32 merge_state(IsoConnection*);
 
 #endif // _ISO_PARSE_TYPES_H

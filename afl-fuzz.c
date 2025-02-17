@@ -1617,7 +1617,7 @@ static void add_to_queue(u8* fname, u32 len, u8 passed_det) {
     unsigned char *buf;
 
     /* opening file for reading */
-    fp = fopen(fname , "rb");
+    fp = fopen((const char*)fname , "rb");
 
     buf = (unsigned char *)ck_alloc(len);
     u32 byte_count = fread(buf, 1, len, fp);
@@ -9088,7 +9088,12 @@ int main(int argc, char** argv) {
         }else if (!strcmp(optarg, "SNMP")) {
           extract_requests = &extract_requests_SNMP;
           extract_response_codes = &extract_response_codes_SNMP;
-        } else {
+        } 
+        else if (!strcmp(optarg, "MMS")) {
+          extract_requests = &extract_requests_mms;
+          extract_response_codes = &extract_response_codes_mms;
+        }
+        else {
           FATAL("%s protocol is not supported yet!", optarg);
         }
 
