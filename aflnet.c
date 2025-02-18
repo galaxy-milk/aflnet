@@ -20,12 +20,6 @@ typedef struct {
 } ByteBuffer;
 
 typedef struct {
-  u8* buf;
-  i32 size;
-  u32 pos;
-} BufReader;
-
-typedef struct {
   u32 state;
   u32 state_count;
 } State;
@@ -70,32 +64,106 @@ typedef enum {
   ACSE_ERROR,
 } AcseIndication;
 
-static void skip_n_bytes(BufReader* reader, u32 n) {
-  reader->pos += n;
-  assert(reader->pos <= reader->size);
+// --end
+static int BerDecoder_decodeLengthRecursive(u8*, int*, int, int, int, int);
+
+static int
+getIndefiniteLength(uint8_t* buffer, int bufPos, int maxBufPos, int depth, int maxDepth)
+{
+    depth++;
+
+    if (depth > maxDepth)
+        return -1;
+
+    int length = 0;
+
+    while (bufPos < maxBufPos) {
+        if ((buffer[bufPos] == 0) && ((bufPos + 1) < maxBufPos) && (buffer[bufPos+1] == 0)) {
+            return length + 2;
+        }
+        else {
+            length++;
+
+            if ((buffer[bufPos++] & 0x1f) == 0x1f) {
+                /* handle extended tags */
+                bufPos++;
+                length++;
+            }
+
+            int subLength = -1;
+
+            int newBufPos = BerDecoder_decodeLengthRecursive(buffer, &subLength, bufPos, maxBufPos, depth, maxDepth);
+
+            if (newBufPos == -1)
+                return -1;
+
+            length += subLength + newBufPos - bufPos;
+
+            bufPos = newBufPos + subLength;
+        }
+    }
+
+    return -1;
 }
 
-static u8 read_byte(BufReader* reader) {
-  assert(reader->pos < reader->size);
-  return reader->buf[(reader->pos)++];
+static int
+BerDecoder_decodeLengthRecursive(uint8_t* buffer, int* length, int bufPos, int maxBufPos, int depth, int maxDepth)
+{
+    if (bufPos >= maxBufPos)
+        return -1;
+
+    uint8_t len1 = buffer[bufPos++];
+
+    if (len1 & 0x80) {
+        int lenLength = len1 & 0x7f;
+
+        if (lenLength == 0) { /* indefinite length form */
+            *length = getIndefiniteLength(buffer, bufPos, maxBufPos, depth, maxDepth);
+        }
+        else {
+            *length = 0;
+
+            int i;
+            for (i = 0; i < lenLength; i++) {
+                if (bufPos >= maxBufPos)
+                    return -1;
+
+                if (bufPos + (*length) > maxBufPos)
+                    return -1;
+
+                *length <<= 8;
+                *length += buffer[bufPos++];
+            }
+        }
+
+    }
+    else {
+        *length = len1;
+    }
+
+    if (*length < 0)
+        return -1;
+
+    if (*length > maxBufPos)
+        return -1;
+
+    if (bufPos + (*length) > maxBufPos)
+        return -1;
+
+    return bufPos;
 }
 
-static u8 peek_byte(BufReader* reader) {
-  assert(reader->pos < reader->size);
-  return reader->buf[reader->pos];
+int
+ber_decode_length(uint8_t* buffer, int* length, int bufPos, int maxBufPos)
+{
+    return BerDecoder_decodeLengthRecursive(buffer, length, bufPos, maxBufPos, 0, 50);
 }
 
-static u32 ber_decode_length(u8* buf, int* len, u32 pos, u32 max_pos) {
-  // assert the simplest length form
-  assert(!(buf[pos] & 0x80));
-  *len = buf[pos++];
-  return pos;
-}
-
-static CotpIndication parse_cotp(IsoConnection* self, ByteBuffer* msg) {
+CotpIndication parse_cotp(IsoConnection* self, ByteBuffer* msg) {
   u8* buf = msg->buf;
   const u8 len = buf[0];
   self->cotp_pdu_type = buf[1];
+
   switch (buf[1]) {
     // conncect confirm
     case 0xd0:
@@ -117,47 +185,53 @@ static CotpIndication parse_cotp(IsoConnection* self, ByteBuffer* msg) {
   }
 }
 
-SessionIndication parse_session_header_parameters(IsoConnection* self, ByteBuffer* msg, const u32 parameter_octets) {
+SessionIndication parse_session_header_parameters(IsoConnection* self, const ByteBuffer* msg) {
   u32 pos = 2;
   u8* buf = msg->buf;
+  assert(msg->size >= 2);
 
-  while (pos < parameter_octets + 2) {
+  while (pos < msg->size) {
+    assert(pos < msg->size - 1);
     const u8 tag = buf[pos++], len = buf[pos++];
+    assert(pos + len <= msg->size);
 
     switch (tag) {
-      case 1:
-      case 5:
-      case 17:
-      case 20:
-      case 25:
-      case 49:
-      case 51:
-      case 52:
-      case 60:
-        pos += len;
-        break;
+      // case 1:
+      // case 5:
+      // case 17:
+      // case 20:
+      // case 25:
+      // case 49:
+      // case 51:
+      // case 52:
+      // case 60:
+      //   pos += len;
+      //   break;
 
       case 193:
         self->user_data.buf = buf + pos;
         self->user_data.size = msg->size - pos;
         return SESSION_OK;
+
+      default:
+        pos += len;
     }
   }
   return SESSION_ERROR;
 }
 
 
-SessionIndication parse_session(IsoConnection* self, ByteBuffer* msg) {
+SessionIndication parse_session(IsoConnection* self, const ByteBuffer* msg) {
   u8* buf = msg->buf;
   const u8 id = buf[0], len = buf[1];
+  // the session length field does not contain SPDU type and itself.
   self->session_spdu_type = id;
-
-  if (len <= 1) return SESSION_ERROR;
 
   switch (id) {
     case 14: /* ACCEPT SPDU */
-      if (len != (msg->size - 2)) return SESSION_ERROR;
-      if (parse_session_header_parameters(self, msg, len) == SESSION_OK)
+      // if (len != (msg->size - 2)) return SESSION_ERROR;
+      assert(len == (msg->size - 2));
+      if (parse_session_header_parameters(self, msg) == SESSION_OK)
         return SESSION_CONNECT;
       else return SESSION_ERROR;
 
@@ -230,6 +304,9 @@ int parse_presentation_user_data(IsoConnection* self, ByteBuffer* msg) {
         self->mms_data.buf = &buf[pos];
         self->mms_data.size = len;
         return 1;
+
+      default:
+        pos += len;
     }
   }
   return 0;
@@ -240,7 +317,7 @@ int parse_mms(IsoConnection* self, ByteBuffer* msg) {
   const u32 max_pos = msg->size;
   u32 pos = 0;
   
-  assert(buf[pos] == 0xa1 || buf[pos] == 0xa9);
+  // assert(buf[pos] == 0xa1 || buf[pos] == 0xa9);
   self->mms_pdu_type = buf[pos++];
   int len;
   pos = ber_decode_length(buf, &len, pos, max_pos);
@@ -257,7 +334,6 @@ u32 merge_state(IsoConnection* self) {
 
   return cotp_pdu_type << 24 | session_spdu_type << 16 | mms_pdu_type << 8 | mms_service_type;
 }
-// --end
 
 // Protocol-specific functions for extracting requests and responses
 
@@ -2647,31 +2723,40 @@ unsigned int* extract_response_codes_ipp(unsigned char* buf, unsigned int buf_si
 
 u32* extract_response_codes_mms(u8* buf, const u32 buf_size, u32* state_count_ref)
 {
+  u8* const og_buf = buf;
   u32 state_count = 0, *state_sequence = NULL;
-
-  BufReader reader;
-  reader.buf = buf;
-  reader.size = buf_size;
-  reader.pos = 0;
+  u32 byte_count = 0;
 
   // initial state
   state_count++;
   state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
   if (state_sequence == NULL) PFATAL("Unable realloc a memory region to store state sequence");
   state_sequence[state_count - 1] = 0;
-  
 
   IsoConnection self;
-  while (reader.pos < reader.size) {
+  while (byte_count < buf_size) {
+    buf = og_buf + byte_count;
     memset(&self, 0, sizeof(IsoConnection));
+    const u32 remained_buf_size = buf_size - byte_count;
+    assert(remained_buf_size >= 4);
     // TPKT
     // assert(buf[pos] == 0x03 && buf[pos + 1] == 0x00);
-    skip_n_bytes(&reader, 2);
-    const u16 packet_len = ((u16)read_byte(&reader) << 8) + read_byte(&reader);
+    const u8 tpkt_ver = buf[0];
+    const u16 tpkt_packet_len = ((u16)buf[2] << 8) + buf[3];
+    byte_count += tpkt_packet_len;
+
+    if (remained_buf_size < tpkt_packet_len) {
+      printf("remained_buf_size = %d, tpkt_packet_len = %d\n", remained_buf_size, tpkt_packet_len);
+      break;
+    }
+
+    if (tpkt_ver != 0x03) {
+      goto collect_state;
+    }
 
     ByteBuffer cotp_buf;
     cotp_buf.buf = buf + 4;
-    cotp_buf.size = packet_len - 4;
+    cotp_buf.size = tpkt_packet_len - 4;
     CotpIndication cotp_indication = parse_cotp(&self, &cotp_buf);
 
     switch (cotp_indication) {
@@ -2686,6 +2771,7 @@ u32* extract_response_codes_mms(u8* buf, const u32 buf_size, u32* state_count_re
         break;
 
       case COTP_MORE_FRAGMENTS_FOLLOW:
+        assert(0);
         break;
     }
 
@@ -2694,7 +2780,7 @@ u32* extract_response_codes_mms(u8* buf, const u32 buf_size, u32* state_count_re
     switch (session_indication) {
       case SESSION_DATA:
         if (!parse_presentation_user_data(&self, &(self.user_data))) {
-          exit(1);
+          assert(0);
         }
         parse_mms(&self, &(self.mms_data));
         break;
@@ -2704,7 +2790,7 @@ u32* extract_response_codes_mms(u8* buf, const u32 buf_size, u32* state_count_re
         // be just discarded.
         break;
       default:
-        exit(1);
+        assert(0);
     }
 
 collect_state:
