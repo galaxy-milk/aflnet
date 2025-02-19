@@ -17,6 +17,7 @@
 typedef struct {
   u8* buf;
   i32 size;
+  u32 max_size;
 } ByteBuffer;
 
 typedef struct {
@@ -29,8 +30,11 @@ typedef struct {
 // } ConfirmedServiceResponse;
 
 typedef struct {
+  u8 cotp_indication;
   u8 cotp_pdu_type;
+  u8 cotp_flow;
   u8 session_spdu_type;
+  u8 session_indication;
   u8 presentation_context_id;
 
   u8 mms_pdu_type;
@@ -42,7 +46,9 @@ typedef struct {
 } IsoConnection;
 
 typedef enum {
+  COTP_OK,
   COTP_ERROR,
+  COTP_INVALID_SIZE,
   COTP_CONNECT_CONFIRM,
   COTP_DATA,
   COTP_MORE_FRAGMENTS_FOLLOW,
@@ -59,6 +65,24 @@ typedef enum {
   SESSION_DISCONNECT,
   SESSION_NOT_FINISHED
 } SessionIndication;
+
+typedef enum {
+  PRESENTATION_OK,
+  PRESENTATION_ERROR,
+  PRESENTATION_SHORT_LENGTH,
+  PRESENTATION_INVALID_TAG,
+  PRESENTATION_INVALID_DATA_VALUE_TAG,
+  PRESENTATION_INVALID_TRANSFER_SYNTAX_NAME,
+  PRESENTATION_INVALID_LENGTH,
+  PRESENTATION_HAS_NO_ABSTRACT_SYNTAX_NAME,
+} PresentationIndication;
+
+typedef enum {
+  MMS_OK,
+  MMS_SHORT,
+  MMS_INVALID,
+  MMS_INVALID_INVOKE_ID,
+} MMSIndication;
 
 typedef enum {
   ACSE_ERROR,
@@ -159,7 +183,40 @@ ber_decode_length(uint8_t* buffer, int* length, int bufPos, int maxBufPos)
     return BerDecoder_decodeLengthRecursive(buffer, length, bufPos, maxBufPos, 0, 50);
 }
 
+uint32_t ber_decode_u32(uint8_t* buffer, int intLen, int bufPos)
+{
+    uint32_t value = 0;
+
+    int i;
+    for (i = 0; i < intLen; i++) {
+        value <<= 8;
+        value += buffer[bufPos + i];
+    }
+
+    return value;
+}
+
+int add_buf_to_payload(IsoConnection* self, const u8* const buf, const u32 size) {
+  if (size < 1 || (self->cotp_payload.size + size < self->cotp_payload.max_size)) {
+    return 1;
+  }
+  u8* dest = self->cotp_payload.buf + self->cotp_payload.size;
+  memcpy(dest, buf, size);
+  self->cotp_payload.size += size;
+  return 0;
+}
+
+void init_conn(IsoConnection* self) {
+  // Cotp payload need to be saved
+  ByteBuffer cotp_payload = self->cotp_payload;
+  memset(self, 0, sizeof(IsoConnection));
+  self->cotp_payload = cotp_payload;
+}
+
 CotpIndication parse_cotp(IsoConnection* self, ByteBuffer* msg) {
+  if (msg->size < 3) {
+    return COTP_INVALID_SIZE;
+  }
   u8* buf = msg->buf;
   const u8 len = buf[0];
   self->cotp_pdu_type = buf[1];
@@ -172,8 +229,10 @@ CotpIndication parse_cotp(IsoConnection* self, ByteBuffer* msg) {
 
       // data
     case 0xf0:
-      self->cotp_payload.buf = buf + 3;
-      self->cotp_payload.size = msg->size - 3;
+      if (!add_buf_to_payload(self, buf + 3, msg->size - 3)) {
+        return COTP_ERROR;
+      }
+      self->cotp_flow = buf[2];
       if (buf[2] & 0x80) {
         return COTP_DATA;
       } else {
@@ -188,12 +247,15 @@ CotpIndication parse_cotp(IsoConnection* self, ByteBuffer* msg) {
 SessionIndication parse_session_header_parameters(IsoConnection* self, const ByteBuffer* msg) {
   u32 pos = 2;
   u8* buf = msg->buf;
-  assert(msg->size >= 2);
 
   while (pos < msg->size) {
-    assert(pos < msg->size - 1);
+    if (pos >= msg->size - 1) {
+      return SESSION_ERROR;
+    }
     const u8 tag = buf[pos++], len = buf[pos++];
-    assert(pos + len <= msg->size);
+    if (pos + len > msg->size) {
+      return SESSION_ERROR;
+    }
 
     switch (tag) {
       // case 1:
@@ -230,7 +292,10 @@ SessionIndication parse_session(IsoConnection* self, const ByteBuffer* msg) {
   switch (id) {
     case 14: /* ACCEPT SPDU */
       // if (len != (msg->size - 2)) return SESSION_ERROR;
-      assert(len == (msg->size - 2));
+      if (len != (msg->size - 2)) {
+        // printf("msg->size = %d, len = %d\n", msg->size, len);
+        return SESSION_ERROR;
+      }
       if (parse_session_header_parameters(self, msg) == SESSION_OK)
         return SESSION_CONNECT;
       else return SESSION_ERROR;
@@ -250,36 +315,35 @@ SessionIndication parse_session(IsoConnection* self, const ByteBuffer* msg) {
   }
 }
 
-int parse_presentation_user_data(IsoConnection* self, ByteBuffer* msg) {
+PresentationIndication parse_presentation_user_data(IsoConnection* self, ByteBuffer* msg) {
   u8* buf = msg->buf;
   const int max_buf_pos = msg->size;
   int pos = 0;
 
   if (max_buf_pos < 9) {
-    assert(0);
-    return 0;
+    return PRESENTATION_SHORT_LENGTH;
   }
 
   if (buf[pos++] != 0x61) {
-    assert(0);
-    return 0;
+    return PRESENTATION_INVALID_TAG;
   }
 
   int len;
   pos = ber_decode_length(buf, &len, pos, max_buf_pos);
-  assert(len > 0);
+  if (pos < 0 || len <= 0) return PRESENTATION_INVALID_LENGTH;
 
   if (buf[pos++] != 0x30) {
-    assert(0);
-    return 0;
+    return PRESENTATION_INVALID_DATA_VALUE_TAG;
   }
 
   pos = ber_decode_length(buf, &len, pos, max_buf_pos);
+  if (pos < 0 || len <= 0) return PRESENTATION_INVALID_LENGTH;
   u8 has_abstract_syntax_name = 0;
 
   while (pos < max_buf_pos) {
     const u8 tag = buf[pos++];
     pos = ber_decode_length(buf, &len, pos, max_buf_pos);
+    if (pos < 0 || len <= 0) return PRESENTATION_INVALID_LENGTH;
 
     switch (tag) {
       case 0x02: /* abstract-syntax-name */
@@ -290,49 +354,91 @@ int parse_presentation_user_data(IsoConnection* self, ByteBuffer* msg) {
 
       case 0x06: /* transfer-syntax-name */
         if (buf[pos] != 0x51 || buf[pos + 1] != 0x01) {
-          assert(0);
-          return 0;
+          return PRESENTATION_INVALID_TRANSFER_SYNTAX_NAME;
         }
         pos += len;
         break;
 
       case 0xa0: /* presentation-data */
         if (has_abstract_syntax_name == 0) {
-          assert(0);
-          return 0;
+          return PRESENTATION_HAS_NO_ABSTRACT_SYNTAX_NAME;
         }
         self->mms_data.buf = &buf[pos];
         self->mms_data.size = len;
-        return 1;
+        return PRESENTATION_OK;
 
       default:
         pos += len;
     }
   }
-  return 0;
+  return PRESENTATION_ERROR;
 }
 
-int parse_mms(IsoConnection* self, ByteBuffer* msg) {
+MMSIndication parse_mms_confirmed_response(IsoConnection* self, u8* const buf, u32 size) {
+  if (size <= 2) return MMS_SHORT;
+  u32 pos = 0, invoke_id = 0;
+  while (pos < size) {
+    u8 tag = buf[pos++], extended_tag = 0;
+    int len;
+    if ((tag & 0x1f) == 0x1f) {
+      extended_tag = 1;
+      tag = buf[pos++];
+    }
+
+    pos = ber_decode_length(buf, &len, pos, size);
+    if (len <= 0 || pos < 0) return MMS_INVALID;
+    if (size - pos < len) return MMS_SHORT;
+
+    switch (tag) {
+      case 0x02:
+        invoke_id = ber_decode_u32(buf, len, pos);
+        break;
+      default:
+        self->mms_service_type = tag;
+    }
+  }
+  return MMS_OK;
+}
+
+// MmsServerConnection_parseMessage
+MMSIndication parse_mms(IsoConnection* self, ByteBuffer* msg) {
+  if (msg->size < 2) return MMS_SHORT;
   u8* buf = msg->buf;
   const u32 max_pos = msg->size;
   u32 pos = 0;
   
   // assert(buf[pos] == 0xa1 || buf[pos] == 0xa9);
-  self->mms_pdu_type = buf[pos++];
+  const u8 pdu_type = buf[pos++];
+  self->mms_pdu_type = pdu_type;
   int len;
   pos = ber_decode_length(buf, &len, pos, max_pos);
+  if (len <= 0 || pos < 0) {
+    return MMS_INVALID;
+  }
 
-  self->mms_service_type = buf[pos];
-  return 1;
+  switch (pdu_type) {
+    case 0xa1:
+      // {
+      //   MMSIndication mms_indication = parse_mms_confirmed_response(self, buf + pos, msg->size - pos);
+      //   if (mms_indication != MMS_OK) return mms_indication;
+      // }
+      return parse_mms_confirmed_response(self, buf + pos, msg->size - pos);
+
+    default:
+      break;
+  }
+
+  return MMS_OK;
 }
 
 u32 merge_state(IsoConnection* self) {
-  const u32 cotp_pdu_type = self->cotp_pdu_type;
-  const u32 session_spdu_type = self->session_spdu_type;
+  const u32 cotp_indication = (self->cotp_pdu_type << 4) | self->cotp_indication;
+  // const u32 session_spdu_type = self->session_spdu_type;
+  const u32 session_indication = self->session_indication;
   const u32 mms_pdu_type = self->mms_pdu_type;
   const u32 mms_service_type = self->mms_service_type;
 
-  return cotp_pdu_type << 24 | session_spdu_type << 16 | mms_pdu_type << 8 | mms_service_type;
+  return cotp_indication << 24 | session_indication << 16 | mms_pdu_type << 8 | mms_service_type;
 }
 
 // Protocol-specific functions for extracting requests and responses
@@ -2734,11 +2840,17 @@ u32* extract_response_codes_mms(u8* buf, const u32 buf_size, u32* state_count_re
   state_sequence[state_count - 1] = 0;
 
   IsoConnection self;
+  self.cotp_payload.buf = (u8*)malloc(65536);
+  self.cotp_payload.max_size = 65536;
+
   while (byte_count < buf_size) {
     buf = og_buf + byte_count;
-    memset(&self, 0, sizeof(IsoConnection));
+    init_conn(&self);
+
     const u32 remained_buf_size = buf_size - byte_count;
-    assert(remained_buf_size >= 4);
+    if (remained_buf_size < 4) {
+      goto collect_state;
+    }
     // TPKT
     // assert(buf[pos] == 0x03 && buf[pos + 1] == 0x00);
     const u8 tpkt_ver = buf[0];
@@ -2758,39 +2870,44 @@ u32* extract_response_codes_mms(u8* buf, const u32 buf_size, u32* state_count_re
     cotp_buf.buf = buf + 4;
     cotp_buf.size = tpkt_packet_len - 4;
     CotpIndication cotp_indication = parse_cotp(&self, &cotp_buf);
+    SessionIndication session_indication;
+    PresentationIndication presentation_indication;
+
+    self.cotp_indication = cotp_indication;
 
     switch (cotp_indication) {
-      case COTP_ERROR:
-        assert(0);
-
+      case COTP_MORE_FRAGMENTS_FOLLOW:
       case COTP_CONNECT_CONFIRM:
         goto collect_state;
         break;
 
       case COTP_DATA:
+        session_indication = parse_session(&self, &(self.cotp_payload));
+        self.cotp_payload.size = 0;
         break;
 
-      case COTP_MORE_FRAGMENTS_FOLLOW:
-        assert(0);
-        break;
+      default:
+        printf("unrecognized cotp_indication 0x%02x\n", cotp_indication);
+        self.cotp_payload.size = 0;
+        goto collect_state;
     }
 
-    SessionIndication session_indication = parse_session(&self, &(self.cotp_payload));
+    self.session_indication = session_indication;
 
     switch (session_indication) {
       case SESSION_DATA:
-        if (!parse_presentation_user_data(&self, &(self.user_data))) {
-          assert(0);
+        presentation_indication = parse_presentation_user_data(&self, &self.user_data);
+        if (presentation_indication != PRESENTATION_OK) {
+          goto collect_state;
         }
         parse_mms(&self, &(self.mms_data));
         break;
-      case SESSION_CONNECT:
+
+      default:
         // I use session_spdu_type field to differ SESSION_CONNECT 
         // and SESSION_DATA packets, so the following content can 
         // be just discarded.
-        break;
-      default:
-        assert(0);
+        goto collect_state;
     }
 
 collect_state:
@@ -2800,6 +2917,7 @@ collect_state:
     state_sequence[state_count - 1] = merge_state(&self);
   }
 
+  free(self.cotp_payload.buf);
   *state_count_ref = state_count;
   return state_sequence;
 }
